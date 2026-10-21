@@ -1,0 +1,30 @@
+[package]
+name = "kestrel-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Throwaway spike: Sentry-compatible ingest + dSYM upload + symbolication"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "multipart", "query", "tokio"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1_smol = "1"
+# getsentry/symbolic. Note: symbolic-symcache depends on symbolic-debuginfo with
+# default features, so all object formats get compiled in regardless of what we ask for.
+symbolic-common = "=13.9.0"
+symbolic-debuginfo = { version = "=13.9.0", default-features = false, features = ["macho"] }
+symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["swift", "cpp"] }
+symbolic-symcache = "=13.9.0"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 4

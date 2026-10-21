@@ -1,0 +1,62 @@
+# XcodeGen spec: `xcodegen generate` in this directory creates KestrelSpike.xcodeproj
+# (generated, not committed).
+name: KestrelSpike
+options:
+  bundleIdPrefix: net.opland
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  Sentry:
+    url: https://github.com/getsentry/sentry-cocoa
+    exactVersion: 9.30.2
+targets:
+  KestrelSpike:
+    type: application
+    platform: iOS
+    sources:
+      - KestrelSpike
+    dependencies:
+      - package: Sentry
+        product: Sentry
+    scheme: {}
+    info:
+      path: KestrelSpike/Info.plist
+      properties:
+        CFBundleDisplayName: Kestrel Spike
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # The simulator talks plain HTTP to the spike server on 127.0.0.1:9000.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.opland.kestrelspike
+        PRODUCT_NAME: KestrelSpike
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_DEBUG_DYLIB: NO
+        ENABLE_PREVIEWS: NO
+        # Ad-hoc signing is enough for the simulator.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+      configs:
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: -O
+          SWIFT_COMPILATION_MODE: wholemodule
+          DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+          # Strip the app binary during a plain `xcodebuild build` (not only on archive), so
+          # the device cannot resolve our Swift names: only server-side symbolication can.
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: all
+          COPY_PHASE_STRIP: YES
+          STRIP_SWIFT_SYMBOLS: YES

@@ -1,0 +1,250 @@
+name: spike
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SENTRY_CLI_VERSION: "3.8.1"
+  XCODEGEN_VERSION: "2.46.0"
+  XCODE_VERSION: "26.2"
+  BUNDLE_ID: net.opland.kestrelspike
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ios-e2e:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CRASH_KINDS: "fatal unwrap nsexception"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: |
+          app="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$app" ]; then
+            echo "::warning::Xcode $XCODE_VERSION not found, using the newest Xcode_26*"
+            find /Applications -maxdepth 1 -name 'Xcode_*.app'
+            app="$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -1)"
+          fi
+          sudo xcode-select -s "$app"
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Install XcodeGen and sentry-cli
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          ln -s "$RUNNER_TEMP/xcodegen/bin/xcodegen" "$RUNNER_TEMP/bin/xcodegen"
+          curl -sSfL -o "$RUNNER_TEMP/bin/sentry-cli" \
+            "https://github.com/getsentry/sentry-cli/releases/download/${SENTRY_CLI_VERSION}/sentry-cli-Darwin-universal"
+          chmod +x "$RUNNER_TEMP/bin/sentry-cli"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/xcodegen" --version
+          "$RUNNER_TEMP/bin/sentry-cli" --version
+
+      - name: Build and start the spike server
+        run: |
+          cargo build --release --manifest-path server/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/captures" "$RUNNER_TEMP/data" "$RUNNER_TEMP/logs"
+          {
+            echo "CAPTURE_DIR=$RUNNER_TEMP/captures"
+            echo "DATA_DIR=$RUNNER_TEMP/data"
+            echo "LOG_DIR=$RUNNER_TEMP/logs"
+          } >> "$GITHUB_ENV"
+          CAPTURE_DIR="$RUNNER_TEMP/captures" DATA_DIR="$RUNNER_TEMP/data" BIND_ADDR=127.0.0.1:9000 \
+            nohup server/target/release/kestrel-spike > "$RUNNER_TEMP/logs/server.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/healthz && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/logs/server.log"
+          exit 1
+
+      - name: Create and boot a simulator
+        run: |
+          runtime="$(xcrun simctl list runtimes -j | python3 -c '
+          import json, sys
+          rts = [r for r in json.load(sys.stdin)["runtimes"] if r["platform"] == "iOS" and r["isAvailable"]]
+          rts.sort(key=lambda r: [int(x) for x in r["version"].split(".")])
+          print(rts[-1]["identifier"])')"
+          echo "runtime: $runtime"
+          udid="$(xcrun simctl create kestrel-spike com.apple.CoreSimulator.SimDeviceType.iPhone-16 "$runtime")"
+          echo "UDID=$udid" >> "$GITHUB_ENV"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+
+      - name: Generate project and build (Release, stripped, dSYM)
+        working-directory: ios
+        run: |
+          xcodegen generate
+          xcodebuild -project KestrelSpike.xcodeproj -scheme KestrelSpike \
+            -configuration Release -sdk iphonesimulator -destination "id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" build > "$LOG_DIR/xcodebuild.log" 2>&1             || { tail -n 80 "$LOG_DIR/xcodebuild.log"; exit 1; }
+          tail -n 15 "$LOG_DIR/xcodebuild.log"
+          products="$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator"
+          app="$products/KestrelSpike.app"
+          dsym="$products/KestrelSpike.app.dSYM"
+          test -d "$app" && test -d "$dsym"
+          {
+            echo "APP_PATH=$app"
+            echo "DSYM_PATH=$dsym"
+          } >> "$GITHUB_ENV"
+          echo "--- UUIDs (app / dSYM)"
+          dwarfdump --uuid "$app/KestrelSpike" "$dsym"
+          echo "--- symbols named like our crash site left in the app binary (expect 0)"
+          leaked="$(nm -a "$app/KestrelSpike" 2>/dev/null | grep -cE 'CrashPipeline|CrashSite|detonate' || true)"
+          echo "$leaked"
+          if [ "$leaked" != "0" ]; then
+            echo "::error::app binary is not stripped ($leaked matching symbols)"
+            exit 1
+          fi
+          ls -la "$app/KestrelSpike"
+
+      - name: Upload dSYM with sentry-cli
+        run: |
+          sentry-cli --url http://127.0.0.1:9000 --auth-token x \
+            debug-files upload --org spike --project spike --wait "$DSYM_PATH"
+          ls -R "$DATA_DIR/difs"
+          ok=1
+          for uuid in $(dwarfdump --uuid "$APP_PATH/KestrelSpike" | awk '{print tolower($2)}'); do
+            if [ -s "$DATA_DIR/difs/$uuid/symcache" ]; then
+              echo "symcache for $uuid: $(wc -c < "$DATA_DIR/difs/$uuid/symcache") bytes"
+            else
+              echo "::error::no symcache for app UUID $uuid"
+              ok=0
+            fi
+          done
+          [ "$ok" = 1 ]
+
+      - name: Install app
+        run: xcrun simctl install "$UDID" "$APP_PATH"
+
+      - name: Crash, relaunch, assert symbolication
+        run: |
+          echo "## iOS crash symbolication" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for kind in $CRASH_KINDS; do
+            bash ci/ios-crash.sh "$kind" || failed=1
+          done
+          python3 ci/summarize.py "$CAPTURE_DIR" >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" = 0 ]
+
+      - name: Collect simulator logs
+        if: failure()
+        run: |
+          xcrun simctl spawn "$UDID" log show --last 30m --style compact \
+            --predicate 'process == "KestrelSpike"' > "$LOG_DIR/simulator-app.log" 2>&1 || true
+          cp ~/Library/Logs/DiagnosticReports/KestrelSpike* "$LOG_DIR/" 2>/dev/null || true
+
+      - name: Package artifacts
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          cp -R "$CAPTURE_DIR" "$RUNNER_TEMP/artifacts/captures" 2>/dev/null || true
+          cp -R "$LOG_DIR" "$RUNNER_TEMP/artifacts/logs" 2>/dev/null || true
+          cp -R "$DATA_DIR/difs" "$RUNNER_TEMP/artifacts/difs" 2>/dev/null || true
+          if [ -n "${DSYM_PATH:-}" ] && [ -d "$DSYM_PATH" ]; then
+            ditto -c -k --keepParent "$DSYM_PATH" "$RUNNER_TEMP/artifacts/KestrelSpike.app.dSYM.zip"
+            cp "$APP_PATH/KestrelSpike" "$RUNNER_TEMP/artifacts/KestrelSpike.stripped"
+          fi
+          ls -la "$RUNNER_TEMP/artifacts"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ios-e2e
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn
+
+  linux-musl:
+    runs-on: ubuntu-24.04
+    needs: ios-e2e
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build static image
+        run: docker build -t kestrel-spike:musl server
+
+      - name: Prove the binary is static
+        run: |
+          docker run --rm kestrel-spike:musl --version
+          cid="$(docker create kestrel-spike:musl)"
+          docker cp "$cid:/kestrel-spike" ./kestrel-spike
+          docker rm "$cid"
+          file ./kestrel-spike | tee file.txt
+          (ldd ./kestrel-spike 2>&1 || true) | tee ldd.txt
+          grep -q 'static' file.txt
+          if grep -q '=>' ldd.txt; then echo "::error::dynamic dependencies found"; exit 1; fi
+          image_bytes="$(docker image inspect -f '{{.Size}}' kestrel-spike:musl)"
+          bin_bytes="$(stat -c %s ./kestrel-spike)"
+          {
+            echo "## Static musl build"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image size | $image_bytes bytes ($((image_bytes / 1024 / 1024)) MiB) |"
+            echo "| binary size | $bin_bytes bytes ($((bin_bytes / 1024 / 1024)) MiB) |"
+            echo "| \`file\` | $(cat file.txt) |"
+            echo "| \`ldd\` | $(tr '\n' ' ' < ldd.txt) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload protocol smoke test (sentry-cli + ELF, static binary)
+        run: |
+          curl -sSfL -o sentry-cli \
+            "https://github.com/getsentry/sentry-cli/releases/download/${SENTRY_CLI_VERSION}/sentry-cli-Linux-x86_64"
+          chmod +x sentry-cli
+          bash ci/linux-smoke.sh ./kestrel-spike ./sentry-cli
+
+      - uses: actions/download-artifact@v8
+        id: ios
+        continue-on-error: true
+        with:
+          name: ios-e2e
+          path: ios-e2e
+
+      - name: Symbolicate the iOS crashes inside the musl image
+        if: steps.ios.outcome == 'success'
+        run: |
+          cd ios-e2e
+          if [ ! -f KestrelSpike.app.dSYM.zip ]; then
+            echo "::warning::no dSYM in ios-e2e artifacts; skipping"
+            exit 0
+          fi
+          unzip -q KestrelSpike.app.dSYM.zip -d dsym
+          echo "## iOS events re-symbolicated by the static musl image" >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          for sym in captures/*.symbolicated.json; do
+            [ -e "$sym" ] || continue
+            id="$(basename "$sym" .symbolicated.json)"
+            docker run --rm -v "$PWD:/work:ro" kestrel-spike:musl \
+              symbolicate "/work/captures/$id.event.json" --dif /work/dsym > "musl-$id.json"
+            if result="$(python3 ../ci/compare.py "$sym" "musl-$id.json")"; then
+              echo "- \`$id\`: $result" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$result"
+              echo "- \`$id\`: **mismatch**" >> "$GITHUB_STEP_SUMMARY"
+              status=1
+            fi
+          done
+          exit "$status"

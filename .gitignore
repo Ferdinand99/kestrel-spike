@@ -1,0 +1,17 @@
+# Rust
+/server/target/
+
+# Xcode / XcodeGen output (generated from ios/project.yml, not committed)
+/ios/*.xcodeproj/
+/ios/KestrelSpike/Info.plist
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+
+# Local spike runs
+captures/
+data/
+*.dSYM/
+*.dSYM.zip
+.DS_Store
